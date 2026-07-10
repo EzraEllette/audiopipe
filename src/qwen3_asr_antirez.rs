@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::hf_cache;
 use crate::model::{Engine, Segment, TranscribeOptions, TranscribeResult};
 use std::ffi::{CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct AntirezAsrEngine {
     ctx: *mut antirez_asr_sys::qwen_ctx_t,
@@ -25,6 +25,16 @@ unsafe impl Sync for AntirezAsrEngine {}
 impl AntirezAsrEngine {
     /// Download safetensors model from HuggingFace by name.
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let (model_dir, model_name) = Self::download_pretrained_files(name)?;
+        Self::load_from_dir(&model_dir, model_name)
+    }
+
+    /// Populate the Hugging Face cache without loading the C inference context.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_files(name).map(drop)
+    }
+
+    fn download_pretrained_files(name: &str) -> Result<(PathBuf, String)> {
         let (repo_name, model_name) = match name {
             "qwen3-asr-0.6b-antirez" | "qwen3-asr-antirez" => {
                 ("Qwen/Qwen3-ASR-0.6B", "qwen3-asr-0.6b-antirez")
@@ -63,7 +73,7 @@ impl AntirezAsrEngine {
             .parent()
             .ok_or_else(|| Error::Other("config.json has no parent dir".into()))?;
 
-        Self::load_from_dir(model_dir, model_name.to_string())
+        Ok((model_dir.to_path_buf(), model_name.to_string()))
     }
 
     /// Local HF cache only — never downloads.
