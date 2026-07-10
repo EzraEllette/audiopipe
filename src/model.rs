@@ -4,6 +4,8 @@
 
 use crate::error::{Error, Result};
 use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Global GPU serialization lock for Metal/MLX operations.
@@ -178,6 +180,51 @@ pub(crate) trait Engine: Send + Sync {
     fn name(&self) -> &str;
 }
 
+// Minimal fake backend for exercising public download routing without network I/O.
+#[cfg(test)]
+const TEST_PRETRAINED_MODEL: &str = "audiopipe-test-pretrained";
+#[cfg(test)]
+static TEST_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_ENGINE_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_DOWNLOAD_RELEASED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+struct TestPretrainedEngine;
+
+#[cfg(test)]
+impl TestPretrainedEngine {
+    fn from_pretrained() -> Self {
+        TEST_ENGINE_CONSTRUCTIONS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+
+    fn download_pretrained() -> Result<()> {
+        TEST_DOWNLOADS.fetch_add(1, Ordering::SeqCst);
+        while !TEST_DOWNLOAD_RELEASED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Engine for TestPretrainedEngine {
+    fn transcribe(
+        &mut self,
+        _audio: &[f32],
+        _sample_rate: u32,
+        _opts: &TranscribeOptions,
+    ) -> Result<TranscribeResult> {
+        unreachable!("the test download backend must never be used for inference")
+    }
+
+    fn name(&self) -> &str {
+        TEST_PRETRAINED_MODEL
+    }
+}
+
 /// Options for transcription.
 #[derive(Debug, Clone)]
 pub struct TranscribeOptions {
@@ -238,6 +285,11 @@ impl Model {
     /// - `"whisper-tiny"` / `"whisper-small"` / etc.
     pub fn from_pretrained(name: &str) -> Result<Self> {
         match name {
+            #[cfg(test)]
+            TEST_PRETRAINED_MODEL => Ok(Self {
+                inner: Box::new(TestPretrainedEngine::from_pretrained()),
+                uses_gpu: false,
+            }),
             #[cfg(feature = "parakeet-mlx")]
             n if n.contains("mlx") && n.starts_with("parakeet") => {
                 let base_name = n.replace("-mlx", "");
@@ -327,6 +379,8 @@ impl Model {
     /// Whisper, or GGML inference state.
     pub fn download_pretrained(name: &str) -> Result<()> {
         match name {
+            #[cfg(test)]
+            TEST_PRETRAINED_MODEL => TestPretrainedEngine::download_pretrained(),
             #[cfg(feature = "parakeet-mlx")]
             n if n.contains("mlx") && n.starts_with("parakeet") => {
                 let base_name = n.replace("-mlx", "");
@@ -494,6 +548,61 @@ mod download_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         changed.notify_all();
+    }
+
+    #[test]
+    fn public_background_download_is_single_flight_and_download_only() {
+        const CALLERS: usize = 16;
+
+        TEST_DOWNLOADS.store(0, Ordering::SeqCst);
+        TEST_ENGINE_CONSTRUCTIONS.store(0, Ordering::SeqCst);
+        TEST_DOWNLOAD_RELEASED.store(false, Ordering::SeqCst);
+        let caller_barrier = Arc::new(Barrier::new(CALLERS));
+
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let caller_barrier = Arc::clone(&caller_barrier);
+                std::thread::spawn(move || {
+                    caller_barrier.wait();
+                    Model::spawn_pretrained_download(TEST_PRETRAINED_MODEL)
+                })
+            })
+            .collect();
+
+        let statuses: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect();
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while TEST_DOWNLOADS.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let downloads = TEST_DOWNLOADS.load(Ordering::SeqCst);
+        let engine_constructions = TEST_ENGINE_CONSTRUCTIONS.load(Ordering::SeqCst);
+
+        // Always let the detached worker exit before asserting so a failed
+        // assertion cannot leave the process-global test worker blocked.
+        TEST_DOWNLOAD_RELEASED.store(true, Ordering::SeqCst);
+        let worker_exited = pretrained_downloads().wait_until_idle(TEST_PRETRAINED_MODEL, TIMEOUT);
+
+        assert!(worker_exited);
+        assert_eq!(downloads, 1);
+        assert_eq!(engine_constructions, 0);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == PretrainedDownloadStatus::Started)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == PretrainedDownloadStatus::AlreadyInProgress)
+                .count(),
+            CALLERS - 1
+        );
     }
 
     #[test]
