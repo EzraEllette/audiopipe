@@ -26,6 +26,16 @@ unsafe impl Sync for Qwen3AsrGgmlEngine {}
 impl Qwen3AsrGgmlEngine {
     /// Download a GGUF model from HuggingFace by name.
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let model_path = Self::download_pretrained_file(name)?;
+        Self::load_from_path(&model_path, name.to_string())
+    }
+
+    /// Populate the Hugging Face cache without loading the GGML model context.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_file(name).map(drop)
+    }
+
+    fn download_pretrained_file(name: &str) -> Result<PathBuf> {
         let (repo_name, filename) = match name {
             "qwen3-asr-0.6b-ggml" | "qwen3-asr-0.6b-ggml-f16" => {
                 ("screenpipe/qwen3-asr-0.6b-gguf", "qwen3-asr-0.6b-f16.gguf")
@@ -51,7 +61,7 @@ impl Qwen3AsrGgmlEngine {
             .get(filename)
             .map_err(|e| Error::Download(format!("{}: {}", filename, e)))?;
 
-        Self::load_from_path(&model_path, name.to_string())
+        Ok(model_path)
     }
 
     /// Local HF cache only — never downloads.

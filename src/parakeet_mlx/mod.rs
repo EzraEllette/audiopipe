@@ -100,6 +100,18 @@ impl ParakeetMlxEngine {
     /// Supported names:
     /// - `"parakeet-tdt-0.6b-v3"` (default MLX community model)
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let model_dir = Self::download_pretrained_files(name)?;
+
+        tracing::info!("loading model from {:?}", model_dir);
+        Self::from_dir(&model_dir, name)
+    }
+
+    /// Populate the Hugging Face cache without allocating MLX arrays or Metal buffers.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_files(name).map(drop)
+    }
+
+    fn download_pretrained_files(name: &str) -> Result<PathBuf> {
         let repo = match name {
             "parakeet-tdt-0.6b-v3" => HF_REPO,
             other => {
@@ -128,8 +140,7 @@ impl ParakeetMlxEngine {
             .unwrap_or(Path::new("."))
             .to_path_buf();
 
-        tracing::info!("loading model from {:?}", model_dir);
-        Self::from_dir(&model_dir, name)
+        Ok(model_dir)
     }
 
     /// Same as [`Self::from_pretrained`] but only uses the local HF cache (no download).

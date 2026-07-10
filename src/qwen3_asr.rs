@@ -18,7 +18,7 @@ use crate::model::{Engine, TranscribeOptions, TranscribeResult};
 
 use half::f16;
 use ndarray::Array2;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Build an ONNX Runtime session with the best available execution provider.
 ///
@@ -412,6 +412,16 @@ impl Qwen3AsrEngine {
     }
 
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let model_dir = Self::download_pretrained_files(name)?;
+        Self::from_dir(&model_dir)
+    }
+
+    /// Populate the Hugging Face cache without constructing ONNX Runtime sessions.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_files(name).map(drop)
+    }
+
+    fn download_pretrained_files(name: &str) -> Result<PathBuf> {
         let repo_name = match name {
             "qwen3-asr-0.6b" => "louis030195/qwen3-asr-0.6b-onnx",
             _ => return Err(Error::ModelNotFound(format!("unknown Qwen3-ASR model: {}", name))),
@@ -435,7 +445,10 @@ impl Qwen3AsrEngine {
 
         let config_path = repo.get("config.json")
             .map_err(|e| Error::Download(e.to_string()))?;
-        Self::from_dir(config_path.parent().unwrap())
+        config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| Error::Other("config.json has no parent dir".into()))
     }
 
     /// Local HF cache only — never downloads.

@@ -16,6 +16,16 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let model_path = Self::download_pretrained_file(name)?;
+        Self::load_from_path(&model_path, name.to_string())
+    }
+
+    /// Populate the Hugging Face cache without constructing a Whisper context.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_file(name).map(drop)
+    }
+
+    fn download_pretrained_file(name: &str) -> Result<PathBuf> {
         let (repo_name, filename) = match name {
             "whisper-large-v3-turbo" => ("ggerganov/whisper.cpp", "ggml-large-v3-turbo.bin"),
             "whisper-large-v3-turbo-q5" => ("ggerganov/whisper.cpp", "ggml-large-v3-turbo-q5_0.bin"),
@@ -37,7 +47,7 @@ impl WhisperEngine {
         let model_path = repo.get(filename)
             .map_err(|e| Error::Download(format!("{}: {}", filename, e)))?;
 
-        Self::load_from_path(&model_path, name.to_string())
+        Ok(model_path)
     }
 
     /// Local HF cache only — never downloads.

@@ -22,6 +22,20 @@ pub struct ParakeetEngine {
 impl ParakeetEngine {
     /// Load from HuggingFace model name.
     pub fn from_pretrained(name: &str) -> Result<Self> {
+        let model_dir = Self::download_pretrained_files(name)?;
+
+        Self::from_dir(&model_dir).map(|mut engine| {
+            engine.name = name.to_string();
+            engine
+        })
+    }
+
+    /// Populate the Hugging Face cache without constructing ONNX Runtime sessions.
+    pub(crate) fn download_pretrained(name: &str) -> Result<()> {
+        Self::download_pretrained_files(name).map(drop)
+    }
+
+    fn download_pretrained_files(name: &str) -> Result<PathBuf> {
         let repo = match name {
             "parakeet-tdt-0.6b-v2" => "istupakov/parakeet-tdt-0.6b-v2-onnx",
             "parakeet-tdt-0.6b-v3" => "istupakov/parakeet-tdt-0.6b-v3-onnx",
@@ -52,10 +66,7 @@ impl ParakeetEngine {
         // Try external weights (needed for fp32 encoder, doesn't exist for int8)
         let _ = model.get("encoder-model.onnx.data");
 
-        Self::from_dir(&model_dir).map(|mut e| {
-            e.name = name.to_string();
-            e
-        })
+        Ok(model_dir)
     }
 
     /// Load from HuggingFace cache only — never downloads. Fails with [`Error::ModelNotCached`]
