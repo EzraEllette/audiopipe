@@ -460,15 +460,20 @@ impl Qwen3AsrEngine {
         let (conv_stem, conv_gpu) = build_session_gpu(&dir.join("conv_stem.onnx"), provider)?;
         let (encoder, encoder_gpu) = build_session_gpu(&dir.join("encoder.onnx"), provider)?;
 
+        // DirectML accepts the decoder graph but fails its input-dependent
+        // Reshape during inference. Keep the convolution and encoder on the
+        // selected GPU while running the dynamic autoregressive decoder on CPU.
+        let decoder_provider = Qwen3ExecutionProvider::Cpu;
+
         // Prefer KV cache decoder, fall back to legacy no-cache decoder.
         let kv_path = dir.join("decoder_kv.onnx");
         let (decoder, has_kv_cache) = if kv_path.exists() {
-            tracing::info!("using KV-cache decoder");
-            (build_session_gpu(&kv_path, provider)?, true)
+            tracing::info!("using KV-cache decoder on CPU");
+            (build_session_gpu(&kv_path, decoder_provider)?, true)
         } else {
-            tracing::info!("using legacy decoder (no KV cache)");
+            tracing::info!("using legacy decoder (no KV cache) on CPU");
             (
-                build_session_gpu(&dir.join("decoder.onnx"), provider)?,
+                build_session_gpu(&dir.join("decoder.onnx"), decoder_provider)?,
                 false,
             )
         };
