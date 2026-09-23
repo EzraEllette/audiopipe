@@ -192,7 +192,7 @@ impl ParakeetEngine {
                 self.provider = provider;
                 self.directml_inferences = 0;
                 tracing::warn!(
-                    "parakeet: recycled DirectML sessions after {} inferences to bound long-running retention",
+                    "parakeet: recycled DirectML sessions after {} inferences to avoid slowdown in long sessions",
                     DIRECTML_SESSION_INFERENCE_BUDGET
                 );
                 Ok(())
@@ -203,6 +203,7 @@ impl ParakeetEngine {
                 );
                 match self.fallback_to_cpu() {
                     Ok(true) => {
+                        self.initialization_recovery_pending = true;
                         tracing::warn!(
                             "parakeet: CPU recovery initialized after DirectML session recycle failure ({gpu_error})"
                         );
@@ -287,6 +288,96 @@ mod provider_tests {
         .to_string();
         assert!(error.contains("provider device failure"));
         assert!(error.contains("CPU construction failure"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "directml"))]
+    #[ignore = "requires the cached real Parakeet model and native DirectML runtime"]
+    fn native_directml_recycle_failure_recovers_once_and_reports_completion() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let filter = std::env::var("SCREENPIPE_TEST_LOG_FILTER")
+            .expect("pass the consumer's production log filter")
+            .parse::<tracing_subscriber::filter::Targets>()
+            .expect("the production filter uses target and level directives");
+        let log_path = std::env::var("SCREENPIPE_TEST_DIRECTML_RECOVERY_LOG")
+            .expect("pass a private output path for the real support collector");
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::fs::File::create(&log_path).unwrap()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("native recovery fixture contact=private.person@example.com");
+            let mut engine = ParakeetEngine::from_pretrained_cache_only_with_provider(
+                "parakeet-tdt-0.6b-v3",
+                ParakeetExecutionProvider::Cpu,
+            )
+            .unwrap();
+            engine.provider = ParakeetExecutionProvider::DirectMlDevice(i32::MAX);
+            engine.directml_inferences = DIRECTML_SESSION_INFERENCE_BUDGET - 1;
+            engine.recycle_directml_sessions_if_needed().unwrap();
+            assert_eq!(
+                engine.provider,
+                ParakeetExecutionProvider::DirectMlDevice(i32::MAX)
+            );
+            assert_eq!(
+                engine.directml_inferences,
+                DIRECTML_SESSION_INFERENCE_BUDGET - 1
+            );
+
+            engine.directml_inferences = DIRECTML_SESSION_INFERENCE_BUDGET;
+            let audio = vec![0.0; 16_000];
+            engine
+                .transcribe(&audio, 16_000, &TranscribeOptions::default())
+                .unwrap();
+            assert_eq!(engine.provider, ParakeetExecutionProvider::Cpu);
+            assert!(!engine.initialization_recovery_pending);
+            assert!(engine.recovery_failure.is_none());
+            engine
+                .transcribe(&audio, 16_000, &TranscribeOptions::default())
+                .unwrap();
+            assert_eq!(engine.provider, ParakeetExecutionProvider::Cpu);
+        });
+
+        let logs = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(logs.matches("DirectML session recycle failed (").count(), 1);
+        assert!(logs.contains("887A0002"));
+        assert!(logs.contains("CPU recovery initialized after DirectML session recycle failure"));
+        assert!(logs.contains("CPU inference completed after DirectML initialization recovery"));
+        assert!(!logs.contains("parakeet: loading"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "directml"))]
+    #[ignore = "requires the cached real Parakeet model and native DirectML runtime"]
+    fn native_directml_recycle_failed_cpu_initialization_is_sticky() {
+        let mut engine = ParakeetEngine::from_pretrained_cache_only_with_provider(
+            "parakeet-tdt-0.6b-v3",
+            ParakeetExecutionProvider::Cpu,
+        )
+        .unwrap();
+        engine.provider = ParakeetExecutionProvider::DirectMlDevice(i32::MAX);
+        engine.directml_inferences = DIRECTML_SESSION_INFERENCE_BUDGET;
+        engine.encoder_path = engine.encoder_path.join("missing-recovery-model.onnx");
+        let audio = vec![0.0; 16_000];
+        let first = engine
+            .transcribe(&audio, 16_000, &TranscribeOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(first.contains("DirectML session recycle failed"));
+        assert!(first.contains("CPU recovery initialization failed"));
+        assert_eq!(engine.provider, ParakeetExecutionProvider::Cpu);
+        assert!(engine.encoder.is_none() && engine.decoder.is_none());
+        let saved_failure = engine.recovery_failure.clone();
+        assert!(saved_failure.is_some());
+        let second = engine
+            .transcribe(&audio, 16_000, &TranscribeOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(second.contains("CPU recovery is unavailable"));
+        assert_eq!(engine.recovery_failure, saved_failure);
     }
 }
 
