@@ -152,13 +152,7 @@ impl ParakeetEngine {
         let ((encoder, decoder, provider), initialization_recovery_pending) =
             initialize_with_fallback(
                 requested_provider,
-                || {
-                    build_sessions(
-                        &encoder_path,
-                        &decoder_path,
-                        ParakeetExecutionProvider::DirectMl,
-                    )
-                },
+                || build_sessions(&encoder_path, &decoder_path, requested_provider),
                 || build_sessions(&encoder_path, &decoder_path, ParakeetExecutionProvider::Cpu),
             )?;
 
@@ -196,7 +190,7 @@ fn initialize_with_fallback<T>(
             );
             match cpu() {
                 Ok(value) => {
-                    tracing::info!(
+                    tracing::warn!(
                         "parakeet: CPU initialization completed after DirectML initialization failure ({error})"
                     );
                     Ok((value, true))
@@ -451,7 +445,7 @@ impl Engine for ParakeetEngine {
             segments,
         };
         if self.initialization_recovery_pending {
-            tracing::info!(
+            tracing::warn!(
                 "parakeet: CPU inference completed after DirectML initialization recovery"
             );
             self.initialization_recovery_pending = false;
