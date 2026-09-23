@@ -568,7 +568,7 @@ impl Model {
                 );
                 match self.inner.transcribe(audio, sample_rate, opts) {
                     Ok(result) => {
-                        tracing::info!(
+                        tracing::warn!(
                             "audiopipe: CPU retry completed after GPU inference failure ({gpu_error})"
                         );
                         Ok(result)
