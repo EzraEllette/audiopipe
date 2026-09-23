@@ -65,8 +65,11 @@ fn build_session(onnx_path: &Path, cache_dir: Option<&Path>) -> Result<ort::sess
 
         match ort::session::Session::builder()
             .map_err(ort_err)
-            .and_then(|b| b.with_execution_providers([ep.build()]).map_err(ort_err))
-            .and_then(|b| b.commit_from_file(onnx_path).map_err(ort_err))
+            .and_then(|b| {
+                b.with_execution_providers([ep.build()])
+                    .map_err(|e| Error::Other(e.to_string()))
+            })
+            .and_then(|mut b| b.commit_from_file(onnx_path).map_err(ort_err))
         {
             Ok(session) => {
                     tracing::info!("qwen3-asr: {} loaded with CoreML {} format", file_name, format_name);
@@ -92,8 +95,11 @@ fn build_session(onnx_path: &Path, cache_dir: Option<&Path>) -> Result<ort::sess
 
         match ort::session::Session::builder()
             .map_err(ort_err)
-            .and_then(|b| b.with_execution_providers([ep.build()]).map_err(ort_err))
-            .and_then(|b| b.commit_from_file(onnx_path).map_err(ort_err))
+            .and_then(|b| {
+                b.with_execution_providers([ep.build()])
+                    .map_err(|e| Error::Other(e.to_string()))
+            })
+            .and_then(|mut b| b.commit_from_file(onnx_path).map_err(ort_err))
         {
             Ok(session) => return Ok(session),
             Err(e) => {
@@ -122,8 +128,11 @@ fn build_session_gpu(onnx_path: &Path) -> Result<ort::session::Session> {
         tracing::info!("qwen3-asr: trying DirectML EP for {}", file_name);
         match ort::session::Session::builder()
             .map_err(ort_err)
-            .and_then(|b| b.with_execution_providers([ep.build()]).map_err(ort_err))
-            .and_then(|b| b.commit_from_file(onnx_path).map_err(ort_err))
+            .and_then(|b| {
+                b.with_execution_providers([ep.build()])
+                    .map_err(|e| Error::Other(e.to_string()))
+            })
+            .and_then(|mut b| b.commit_from_file(onnx_path).map_err(ort_err))
         {
             Ok(session) => {
                 tracing::info!("qwen3-asr: {} loaded with DirectML", file_name);
