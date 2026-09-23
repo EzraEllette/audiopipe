@@ -180,6 +180,16 @@ pub enum ParakeetExecutionProvider {
     DirectMlDevice(i32),
 }
 
+/// Requested execution provider for ONNX Qwen3-ASR models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Qwen3ExecutionProvider {
+    /// Use the CPU execution provider.
+    #[default]
+    Cpu,
+    /// Use the exact DirectML adapter ordinal selected by the caller.
+    DirectMlDevice(i32),
+}
+
 impl ParakeetExecutionProvider {
     pub(crate) fn legacy_default() -> Self {
         #[cfg(all(target_os = "windows", feature = "directml"))]
@@ -414,6 +424,28 @@ impl Model {
                 name
             ))),
         }
+    }
+
+    /// Load cached Qwen3-ASR with an explicit execution provider.
+    pub fn from_pretrained_cache_only_with_qwen3_provider(
+        name: &str,
+        provider: Qwen3ExecutionProvider,
+    ) -> Result<Self> {
+        #[cfg(feature = "qwen3-asr")]
+        if name.starts_with("qwen3-asr") && !name.contains("antirez") && !name.contains("ggml") {
+            let engine =
+                crate::qwen3_asr::Qwen3AsrEngine::from_pretrained_cache_only_with_provider(
+                    name, provider,
+                )?;
+            return Ok(Self {
+                inner: Box::new(engine),
+                uses_gpu: false,
+            });
+        }
+        let _ = provider;
+        Err(Error::ModelNotFound(format!(
+            "unknown ONNX Qwen3-ASR model '{name}'"
+        )))
     }
 
     /// Download all artifacts required by a pretrained model without constructing its engine.
