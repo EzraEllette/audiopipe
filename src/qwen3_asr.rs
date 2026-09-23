@@ -275,6 +275,7 @@ pub struct Qwen3AsrEngine {
     has_kv_cache: bool,
     model_dir: PathBuf,
     using_directml: bool,
+    decoder_directml: bool,
     recovery_failure: Option<String>,
     /// Positional embeddings stored flat as f16 [max_positions × d_model].
     pos_emb: Vec<f16>,
@@ -502,6 +503,7 @@ impl Qwen3AsrEngine {
             has_kv_cache,
             model_dir: dir.to_path_buf(),
             using_directml,
+            decoder_directml: decoder_gpu,
             recovery_failure: None,
             pos_emb,
             pos_emb_cols,
@@ -838,7 +840,7 @@ impl Qwen3AsrEngine {
 
             tracing::info!(
                 "pipeline: prefill ({}) {:.3}s, prompt_len={}",
-                if self.using_directml {
+                if self.decoder_directml {
                     "DirectML"
                 } else {
                     "CPU"
@@ -1028,6 +1030,7 @@ impl Engine for Qwen3AsrEngine {
         }
         tracing::warn!("qwen3-asr: releasing failed DirectML sessions before CPU recovery");
         self.using_directml = false;
+        self.decoder_directml = false;
         drop(self.conv_stem.take());
         drop(self.encoder.take());
         drop(self.decoder.take());
