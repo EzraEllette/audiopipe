@@ -6,7 +6,9 @@ use crate::audio::{self, MelConfig};
 use crate::context_bias::{argmax, ContextBiaser};
 use crate::error::{Error, Result};
 use crate::hf_cache;
-use crate::model::{Engine, Segment, TranscribeOptions, TranscribeResult};
+use crate::model::{
+    Engine, ParakeetExecutionProvider, Segment, TranscribeOptions, TranscribeResult,
+};
 use ndarray::{Array1, Array2, Array3};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +19,9 @@ pub struct ParakeetEngine {
     vocab: Vec<String>,
     vocab_size: usize,
     name: String,
+    encoder_path: PathBuf,
+    decoder_path: PathBuf,
+    provider: ParakeetExecutionProvider,
 }
 
 impl ParakeetEngine {
@@ -72,6 +77,13 @@ impl ParakeetEngine {
     /// Load from HuggingFace cache only — never downloads. Fails with [`Error::ModelNotCached`]
     /// if any required file is missing locally.
     pub fn from_pretrained_cache_only(name: &str) -> Result<Self> {
+        Self::from_pretrained_cache_only_with_provider(name, ParakeetExecutionProvider::Cpu)
+    }
+
+    pub fn from_pretrained_cache_only_with_provider(
+        name: &str,
+        provider: ParakeetExecutionProvider,
+    ) -> Result<Self> {
         let repo = match name {
             "parakeet-tdt-0.6b-v2" => "istupakov/parakeet-tdt-0.6b-v2-onnx",
             "parakeet-tdt-0.6b-v3" => "istupakov/parakeet-tdt-0.6b-v3-onnx",
@@ -98,7 +110,7 @@ impl ParakeetEngine {
         }
         let _ = hf_cache::cache_get(repo, "encoder-model.onnx.data");
 
-        Self::from_dir(&model_dir).map(|mut e| {
+        Self::from_dir_with_provider(&model_dir, provider).map(|mut e| {
             e.name = name.to_string();
             e
         })
@@ -106,6 +118,13 @@ impl ParakeetEngine {
 
     /// Load from a local directory containing ONNX files + vocab.txt.
     pub fn from_dir(dir: &Path) -> Result<Self> {
+        Self::from_dir_with_provider(dir, ParakeetExecutionProvider::Cpu)
+    }
+
+    pub fn from_dir_with_provider(
+        dir: &Path,
+        requested_provider: ParakeetExecutionProvider,
+    ) -> Result<Self> {
         // Prefer int8 models: they're self-contained (no external .data files) and
         // work with CoreML's MLProgram format for ANE acceleration.
         // fp32 models with external data can't use CoreML due to ort limitations.
@@ -119,11 +138,17 @@ impl ParakeetEngine {
         let vocab = load_vocab(&vocab_path)?;
         let vocab_size = vocab.len();
 
-        tracing::info!("loading encoder from {}", encoder_path.display());
-        let encoder = build_session_with_ep(&encoder_path)?;
-
-        tracing::info!("loading decoder from {}", decoder_path.display());
-        let decoder = build_session_with_ep(&decoder_path)?;
+        let (encoder, decoder, provider) = initialize_with_fallback(
+            requested_provider,
+            || {
+                build_sessions(
+                    &encoder_path,
+                    &decoder_path,
+                    ParakeetExecutionProvider::DirectMl,
+                )
+            },
+            || build_sessions(&encoder_path, &decoder_path, ParakeetExecutionProvider::Cpu),
+        )?;
 
         tracing::info!("parakeet loaded: vocab_size={}", vocab_size);
 
@@ -133,7 +158,58 @@ impl ParakeetEngine {
             vocab,
             vocab_size,
             name: "parakeet".to_string(),
+            encoder_path,
+            decoder_path,
+            provider,
         })
+    }
+}
+
+fn initialize_with_fallback<T>(
+    requested_provider: ParakeetExecutionProvider,
+    directml: impl FnOnce() -> Result<T>,
+    cpu: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if requested_provider == ParakeetExecutionProvider::Cpu {
+        return cpu();
+    }
+    match directml() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            tracing::warn!(
+                "parakeet: DirectML initialization failed ({}); falling back to CPU",
+                error
+            );
+            cpu()
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+
+    #[test]
+    fn directml_initialization_failure_uses_cpu_once() {
+        let mut directml_calls = 0;
+        let mut cpu_calls = 0;
+        let provider = initialize_with_fallback(
+            ParakeetExecutionProvider::DirectMl,
+            || {
+                directml_calls += 1;
+                Err(Error::Other(
+                    "representative provider registration failure".to_string(),
+                ))
+            },
+            || {
+                cpu_calls += 1;
+                Ok(ParakeetExecutionProvider::Cpu)
+            },
+        )
+        .unwrap();
+        assert_eq!(provider, ParakeetExecutionProvider::Cpu);
+        assert_eq!(directml_calls, 1);
+        assert_eq!(cpu_calls, 1);
     }
 }
 
@@ -146,22 +222,35 @@ impl ParakeetEngine {
 ///
 /// On Windows with `directml` feature: tries DirectML for GPU acceleration.
 /// Falls back to CPU if no accelerator works.
-fn build_session_with_ep(onnx_path: &std::path::Path) -> Result<ort::session::Session> {
+fn build_sessions(
+    encoder_path: &Path,
+    decoder_path: &Path,
+    provider: ParakeetExecutionProvider,
+) -> Result<(
+    ort::session::Session,
+    ort::session::Session,
+    ParakeetExecutionProvider,
+)> {
+    tracing::info!("loading encoder from {}", encoder_path.display());
+    let encoder = build_session_with_ep(encoder_path, provider)?;
+    tracing::info!("loading decoder from {}", decoder_path.display());
+    let decoder = build_session_with_ep(decoder_path, provider)?;
+    Ok((encoder, decoder, provider))
+}
+
+fn build_session_with_ep(
+    onnx_path: &std::path::Path,
+    provider: ParakeetExecutionProvider,
+) -> Result<ort::session::Session> {
     let file_name = onnx_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    // DirectML GPU acceleration — opt-in via SCREENPIPE_DIRECTML=1 env var.
-    // Screenpipe's GPU detection sets this when a discrete GPU (NVIDIA/AMD/Intel Arc)
-    // with ≥1GB VRAM is found. Falls back to CPU on failure.
     #[cfg(feature = "directml")]
     {
-        let use_directml = std::env::var("SCREENPIPE_DIRECTML")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if use_directml {
+        if provider == ParakeetExecutionProvider::DirectMl {
             // ort rc.12: each builder step returns Result<SessionBuilder, Error<SessionBuilder>>,
             // whose error type doesn't unify across `.and_then` (E0308), so normalize each step
             // with map_err + `?` exactly like the CPU path below. Wrapped in a closure so the
@@ -169,26 +258,37 @@ fn build_session_with_ep(onnx_path: &std::path::Path) -> Result<ort::session::Se
             let directml_session: Result<ort::session::Session> = (|| {
                 Ok(ort::session::Session::builder()?
                     .with_execution_providers([
-                        ort::execution_providers::DirectMLExecutionProvider::default().build(),
+                        ort::execution_providers::DirectMLExecutionProvider::default()
+                            .with_performance_preference(ort::execution_providers::directml::PerformancePreference::HighPerformance)
+                            .build()
+                            .error_on_failure(),
                     ])
+                    .map_err(|e| Error::Other(e.to_string()))?
+                    .with_parallel_execution(false)
+                    .map_err(|e| Error::Other(e.to_string()))?
+                    .with_memory_pattern(false)
                     .map_err(|e| Error::Other(e.to_string()))?
                     .commit_from_file(onnx_path)?)
             })();
-            match directml_session
-            {
+            match directml_session {
                 Ok(session) => {
                     tracing::info!("parakeet: DirectML session created for {}", file_name);
                     return Ok(session);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "parakeet: DirectML failed for {}, falling back to CPU: {}",
-                        file_name,
-                        e
-                    );
+                    return Err(Error::Other(format!(
+                        "DirectML failed for {file_name}: {e}"
+                    )));
                 }
             }
         }
+    }
+
+    #[cfg(not(feature = "directml"))]
+    if provider == ParakeetExecutionProvider::DirectMl {
+        return Err(Error::Other(
+            "DirectML support is not compiled in".to_string(),
+        ));
     }
 
     // CPU execution with thread limiting — default path.
@@ -294,6 +394,28 @@ impl Engine for ParakeetEngine {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn execution_provider(&self) -> Option<&'static str> {
+        Some(match self.provider {
+            ParakeetExecutionProvider::Cpu => "CPU",
+            ParakeetExecutionProvider::DirectMl => "DirectML",
+        })
+    }
+
+    fn fallback_to_cpu(&mut self) -> Result<bool> {
+        if self.provider != ParakeetExecutionProvider::DirectMl {
+            return Ok(false);
+        }
+        let (encoder, decoder, provider) = build_sessions(
+            &self.encoder_path,
+            &self.decoder_path,
+            ParakeetExecutionProvider::Cpu,
+        )?;
+        self.encoder = encoder;
+        self.decoder = decoder;
+        self.provider = provider;
+        Ok(true)
     }
 }
 

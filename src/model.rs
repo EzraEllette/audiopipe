@@ -169,6 +169,16 @@ pub struct Model {
     uses_gpu: bool,
 }
 
+/// Requested execution provider for ONNX Parakeet models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParakeetExecutionProvider {
+    /// Use the CPU execution provider.
+    #[default]
+    Cpu,
+    /// Try DirectML's high-performance GPU selection, then fall back to CPU.
+    DirectMl,
+}
+
 /// Engine trait — implemented by each backend (Parakeet, Whisper, etc.).
 pub(crate) trait Engine: Send + Sync {
     fn transcribe(
@@ -178,6 +188,12 @@ pub(crate) trait Engine: Send + Sync {
         opts: &TranscribeOptions,
     ) -> Result<TranscribeResult>;
     fn name(&self) -> &str;
+    fn execution_provider(&self) -> Option<&'static str> {
+        None
+    }
+    fn fallback_to_cpu(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // Minimal fake backend for exercising public download routing without network I/O.
@@ -332,6 +348,15 @@ impl Model {
     /// Returns [`Error::ModelNotCached`] if a download is still needed — use [`Self::spawn_pretrained_download`]
     /// then retry later with this method or [`Self::from_pretrained`].
     pub fn from_pretrained_cache_only(name: &str) -> Result<Self> {
+        Self::from_pretrained_cache_only_with_provider(name, ParakeetExecutionProvider::Cpu)
+    }
+
+    /// Load a cached model with an explicit Parakeet execution-provider preference.
+    /// Non-Parakeet models ignore `provider`.
+    pub fn from_pretrained_cache_only_with_provider(
+        name: &str,
+        provider: ParakeetExecutionProvider,
+    ) -> Result<Self> {
         match name {
             #[cfg(feature = "parakeet-mlx")]
             n if n.contains("mlx") && n.starts_with("parakeet") => {
@@ -342,7 +367,7 @@ impl Model {
             }
             #[cfg(feature = "parakeet")]
             n if n.starts_with("parakeet") => {
-                let engine = crate::parakeet::ParakeetEngine::from_pretrained_cache_only(n)?;
+                let engine = crate::parakeet::ParakeetEngine::from_pretrained_cache_only_with_provider(n, provider)?;
                 Ok(Self { inner: Box::new(engine), uses_gpu: false })
             }
             #[cfg(feature = "whisper")]
@@ -483,7 +508,8 @@ impl Model {
         opts: TranscribeOptions,
     ) -> Result<TranscribeResult> {
         let _guard = self.acquire_gpu_lock();
-        self.inner.transcribe(audio, 16000, &opts)
+        let first = self.inner.transcribe(audio, 16000, &opts);
+        self.retry_after_provider_failure(first, audio, 16000, &opts)
     }
 
     /// Transcribe audio at a given sample rate (resampled internally to 16kHz).
@@ -494,11 +520,41 @@ impl Model {
         opts: TranscribeOptions,
     ) -> Result<TranscribeResult> {
         let _guard = self.acquire_gpu_lock();
-        if sample_rate == 16000 {
-            return self.inner.transcribe(audio, 16000, &opts);
+        let resampled;
+        let audio = if sample_rate == 16000 {
+            audio
+        } else {
+            resampled = crate::audio::resample(audio, sample_rate, 16000);
+            &resampled
+        };
+        let first = self.inner.transcribe(audio, 16000, &opts);
+        self.retry_after_provider_failure(first, audio, 16000, &opts)
+    }
+
+    fn retry_after_provider_failure(
+        &mut self,
+        first: Result<TranscribeResult>,
+        audio: &[f32],
+        sample_rate: u32,
+        opts: &TranscribeOptions,
+    ) -> Result<TranscribeResult> {
+        match first {
+            Ok(result) => Ok(result),
+            Err(gpu_error) if self.inner.fallback_to_cpu()? => {
+                tracing::warn!(
+                    "audiopipe: GPU inference failed ({}); rebuilt Parakeet on CPU and retrying the same audio",
+                    gpu_error
+                );
+                self.inner
+                    .transcribe(audio, sample_rate, opts)
+                    .map_err(|cpu_error| {
+                        Error::Other(format!(
+                            "GPU inference failed ({gpu_error}); CPU retry failed ({cpu_error})"
+                        ))
+                    })
+            }
+            Err(error) => Err(error),
         }
-        let resampled = crate::audio::resample(audio, sample_rate, 16000);
-        self.inner.transcribe(&resampled, 16000, &opts)
     }
 
     /// Acquire the GPU lock if this model uses a GPU backend.
@@ -516,6 +572,11 @@ impl Model {
     /// Model name.
     pub fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    /// Active execution provider, when the backend exposes one.
+    pub fn execution_provider(&self) -> Option<&'static str> {
+        self.inner.execution_provider()
     }
 }
 
@@ -815,5 +876,85 @@ mod download_tests {
         );
         assert!(coordinator.wait_until_idle("retry-panic", TIMEOUT));
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod provider_fallback_tests {
+    use super::*;
+
+    struct FailingGpu {
+        calls: usize,
+        fallback_calls: usize,
+        cpu_succeeds: bool,
+    }
+
+    impl Engine for FailingGpu {
+        fn transcribe(
+            &mut self,
+            audio: &[f32],
+            _sample_rate: u32,
+            _opts: &TranscribeOptions,
+        ) -> Result<TranscribeResult> {
+            self.calls += 1;
+            if self.fallback_calls == 0 || !self.cpu_succeeds {
+                return Err(Error::Other(if self.fallback_calls == 0 {
+                    "representative DirectML device-removed failure".to_string()
+                } else {
+                    "representative CPU failure".to_string()
+                }));
+            }
+            Ok(TranscribeResult {
+                text: format!("recovered {} samples", audio.len()),
+                segments: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "test-parakeet"
+        }
+
+        fn fallback_to_cpu(&mut self) -> Result<bool> {
+            self.fallback_calls += 1;
+            Ok(self.fallback_calls == 1)
+        }
+    }
+
+    #[test]
+    fn gpu_inference_failure_retries_same_audio_once_on_cpu() {
+        let engine = FailingGpu {
+            calls: 0,
+            fallback_calls: 0,
+            cpu_succeeds: true,
+        };
+        let mut model = Model {
+            inner: Box::new(engine),
+            uses_gpu: false,
+        };
+        let audio = [0.1, 0.2, 0.3];
+        let result = model
+            .transcribe(&audio, TranscribeOptions::default())
+            .unwrap();
+        assert_eq!(result.text, "recovered 3 samples");
+    }
+
+    #[test]
+    fn gpu_and_cpu_causes_are_preserved_without_a_retry_loop() {
+        let engine = FailingGpu {
+            calls: 0,
+            fallback_calls: 0,
+            cpu_succeeds: false,
+        };
+        let mut model = Model {
+            inner: Box::new(engine),
+            uses_gpu: false,
+        };
+        let error = model
+            .transcribe(&[0.1], TranscribeOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("DirectML device-removed"));
+        assert!(error.contains("CPU retry failed"));
+        assert!(error.contains("representative CPU failure"));
     }
 }

@@ -43,4 +43,7 @@ pub mod qwen3_asr_antirez;
 pub mod parakeet_mlx;
 
 pub use error::Error;
-pub use model::{Model, PretrainedDownloadStatus, Segment, TranscribeOptions, TranscribeResult};
+pub use model::{
+    Model, ParakeetExecutionProvider, PretrainedDownloadStatus, Segment, TranscribeOptions,
+    TranscribeResult,
+};
