@@ -11,6 +11,8 @@ use crate::model::{
 use ndarray::{Array1, Array2, Array3};
 use std::path::{Path, PathBuf};
 
+const DIRECTML_SESSION_INFERENCE_BUDGET: u32 = 512;
+
 /// Parakeet TDT engine using ONNX Runtime.
 pub struct ParakeetEngine {
     encoder: Option<ort::session::Session>,
@@ -23,6 +25,7 @@ pub struct ParakeetEngine {
     provider: ParakeetExecutionProvider,
     recovery_failure: Option<String>,
     initialization_recovery_pending: bool,
+    directml_inferences: u32,
 }
 
 impl ParakeetEngine {
@@ -169,7 +172,49 @@ impl ParakeetEngine {
             provider,
             recovery_failure: None,
             initialization_recovery_pending,
+            directml_inferences: 0,
         })
+    }
+
+    fn recycle_directml_sessions_if_needed(&mut self) -> Result<()> {
+        if self.provider == ParakeetExecutionProvider::Cpu
+            || self.directml_inferences < DIRECTML_SESSION_INFERENCE_BUDGET
+        {
+            return Ok(());
+        }
+
+        self.encoder.take();
+        self.decoder.take();
+        match build_sessions(&self.encoder_path, &self.decoder_path, self.provider) {
+            Ok((encoder, decoder, provider)) => {
+                self.encoder = Some(encoder);
+                self.decoder = Some(decoder);
+                self.provider = provider;
+                self.directml_inferences = 0;
+                tracing::warn!(
+                    "parakeet: recycled DirectML sessions after {} inferences to bound long-running retention",
+                    DIRECTML_SESSION_INFERENCE_BUDGET
+                );
+                Ok(())
+            }
+            Err(gpu_error) => {
+                tracing::warn!(
+                    "parakeet: DirectML session recycle failed ({gpu_error}); falling back to CPU"
+                );
+                match self.fallback_to_cpu() {
+                    Ok(true) => {
+                        tracing::warn!(
+                            "parakeet: CPU recovery initialized after DirectML session recycle failure ({gpu_error})"
+                        );
+                        Ok(())
+                    }
+                    Ok(false) => Err(gpu_error),
+                    Err(cpu_error) => Err(Error::Other(format!(
+                        "DirectML session recycle failed ({gpu_error}); CPU recovery initialization failed ({cpu_error})"
+                    ))),
+                }
+            }
+        }
     }
 }
 
@@ -374,6 +419,7 @@ impl Engine for ParakeetEngine {
                 "Parakeet CPU recovery is unavailable after GPU failure: {error}"
             )));
         }
+        self.recycle_directml_sessions_if_needed()?;
         let encoder = self.encoder.as_mut().ok_or_else(|| {
             Error::Other("Parakeet encoder unavailable after provider transition".to_string())
         })?;
@@ -449,6 +495,9 @@ impl Engine for ParakeetEngine {
                 "parakeet: CPU inference completed after DirectML initialization recovery"
             );
             self.initialization_recovery_pending = false;
+        }
+        if self.provider != ParakeetExecutionProvider::Cpu {
+            self.directml_inferences = self.directml_inferences.saturating_add(1);
         }
         Ok(result)
     }
