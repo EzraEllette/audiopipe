@@ -22,6 +22,7 @@ pub struct ParakeetEngine {
     decoder_path: PathBuf,
     provider: ParakeetExecutionProvider,
     recovery_failure: Option<String>,
+    initialization_recovery_pending: bool,
 }
 
 impl ParakeetEngine {
@@ -148,17 +149,18 @@ impl ParakeetEngine {
         let vocab = load_vocab(&vocab_path)?;
         let vocab_size = vocab.len();
 
-        let (encoder, decoder, provider) = initialize_with_fallback(
-            requested_provider,
-            || {
-                build_sessions(
-                    &encoder_path,
-                    &decoder_path,
-                    ParakeetExecutionProvider::DirectMl,
-                )
-            },
-            || build_sessions(&encoder_path, &decoder_path, ParakeetExecutionProvider::Cpu),
-        )?;
+        let ((encoder, decoder, provider), initialization_recovery_pending) =
+            initialize_with_fallback(
+                requested_provider,
+                || {
+                    build_sessions(
+                        &encoder_path,
+                        &decoder_path,
+                        ParakeetExecutionProvider::DirectMl,
+                    )
+                },
+                || build_sessions(&encoder_path, &decoder_path, ParakeetExecutionProvider::Cpu),
+            )?;
 
         tracing::info!("parakeet loaded: vocab_size={}", vocab_size);
 
@@ -172,6 +174,7 @@ impl ParakeetEngine {
             decoder_path,
             provider,
             recovery_failure: None,
+            initialization_recovery_pending,
         })
     }
 }
@@ -180,12 +183,12 @@ fn initialize_with_fallback<T>(
     requested_provider: ParakeetExecutionProvider,
     directml: impl FnOnce() -> Result<T>,
     cpu: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, bool)> {
     if requested_provider == ParakeetExecutionProvider::Cpu {
-        return cpu();
+        return cpu().map(|value| (value, false));
     }
     match directml() {
-        Ok(value) => Ok(value),
+        Ok(value) => Ok((value, false)),
         Err(error) => {
             tracing::warn!(
                 "parakeet: DirectML initialization failed ({}); falling back to CPU",
@@ -196,7 +199,7 @@ fn initialize_with_fallback<T>(
                     tracing::info!(
                         "parakeet: CPU initialization completed after DirectML initialization failure ({error})"
                     );
-                    Ok(value)
+                    Ok((value, true))
                 }
                 Err(cpu_error) => Err(Error::Other(format!(
                     "DirectML initialization failed ({error}); CPU initialization failed ({cpu_error})"
@@ -214,7 +217,7 @@ mod provider_tests {
     fn directml_initialization_failure_uses_cpu_once() {
         let mut directml_calls = 0;
         let mut cpu_calls = 0;
-        let provider = initialize_with_fallback(
+        let (provider, recovered) = initialize_with_fallback(
             ParakeetExecutionProvider::DirectMl,
             || {
                 directml_calls += 1;
@@ -229,6 +232,7 @@ mod provider_tests {
         )
         .unwrap();
         assert_eq!(provider, ParakeetExecutionProvider::Cpu);
+        assert!(recovered);
         assert_eq!(directml_calls, 1);
         assert_eq!(cpu_calls, 1);
     }
@@ -442,10 +446,17 @@ impl Engine for ParakeetEngine {
             }
         }
 
-        Ok(TranscribeResult {
+        let result = TranscribeResult {
             text: text.trim().to_string(),
             segments,
-        })
+        };
+        if self.initialization_recovery_pending {
+            tracing::info!(
+                "parakeet: CPU inference completed after DirectML initialization recovery"
+            );
+            self.initialization_recovery_pending = false;
+        }
+        Ok(result)
     }
 
     fn name(&self) -> &str {
