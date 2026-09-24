@@ -1100,3 +1100,46 @@ fn strip_asr_prefix(raw_text: &str) -> String {
         }
     }
 }
+
+#[cfg(all(test, target_os = "windows", feature = "directml"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires cached Qwen artifacts and a real DirectML adapter"]
+    fn failed_real_cpu_recovery_is_sticky_across_transcribe_calls() {
+        let mut engine = Qwen3AsrEngine::from_pretrained_cache_only_with_provider(
+            "qwen3-asr-0.6b",
+            Qwen3ExecutionProvider::DirectMlDevice(1),
+        )
+        .expect("real DirectML Qwen initialization");
+        assert!(
+            engine.using_directml,
+            "test must start with real GPU sessions"
+        );
+        engine.model_dir = std::env::temp_dir().join(format!(
+            "audiopipe-missing-qwen-{}",
+            std::process::id()
+        ));
+
+        let recovery = engine
+            .fallback_to_cpu()
+            .expect_err("CPU session rebuild must fail without artifacts")
+            .to_string();
+        let opts = TranscribeOptions::default();
+        let first = engine
+            .transcribe(&[], 16_000, &opts)
+            .unwrap_err()
+            .to_string();
+        let second = engine
+            .transcribe(&[], 16_000, &opts)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(first, second, "terminal recovery cause must remain sticky");
+        assert!(first.contains(&recovery));
+        assert!(!engine.using_directml);
+        assert!(engine.conv_stem.is_none());
+        assert!(engine.encoder.is_none());
+        assert!(engine.decoder.is_none());
+    }
+}
