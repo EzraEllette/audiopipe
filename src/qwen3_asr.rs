@@ -194,7 +194,10 @@ fn build_session_gpu(
                     file_name,
                     e
                 );
-                if provider == Qwen3ExecutionProvider::Auto {
+                if matches!(
+                    provider,
+                    Qwen3ExecutionProvider::Auto | Qwen3ExecutionProvider::DirectMlDevice(_)
+                ) {
                     let cpu = build_session_cpu(onnx_path).map_err(|cpu_error| Error::Other(
                         format!("DirectML failed for {file_name} ({e}); CPU initialization failed ({cpu_error})")
                     ))?;
