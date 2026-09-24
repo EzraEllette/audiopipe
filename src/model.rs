@@ -183,8 +183,10 @@ pub enum ParakeetExecutionProvider {
 /// Requested execution provider for ONNX Qwen3-ASR models.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Qwen3ExecutionProvider {
-    /// Use the CPU execution provider.
+    /// Automatically use DirectML on Windows when it is compiled in.
     #[default]
+    Auto,
+    /// Use the CPU execution provider.
     Cpu,
     /// Use the exact DirectML adapter ordinal selected by the caller.
     DirectMlDevice(i32),

@@ -142,7 +142,7 @@ fn build_session(onnx_path: &Path, cache_dir: Option<&Path>) -> Result<ort::sess
 fn build_session_gpu(
     onnx_path: &Path,
     provider: Qwen3ExecutionProvider,
-) -> Result<(ort::session::Session, bool)> {
+) -> Result<(ort::session::Session, bool, bool)> {
     let file_name = onnx_path
         .file_name()
         .unwrap_or_default()
@@ -152,6 +152,11 @@ fn build_session_gpu(
     #[cfg(feature = "directml")]
     {
         let ep = match provider {
+            Qwen3ExecutionProvider::Auto => {
+                ort::execution_providers::DirectMLExecutionProvider::default()
+                    .build()
+                    .error_on_failure()
+            }
             Qwen3ExecutionProvider::DirectMlDevice(device_id) => {
                 ort::execution_providers::DirectMLExecutionProvider::default()
                     .with_device_id(device_id)
@@ -159,7 +164,7 @@ fn build_session_gpu(
                     .error_on_failure()
             }
             Qwen3ExecutionProvider::Cpu => {
-                return Ok((build_session_cpu(onnx_path)?, false));
+                return Ok((build_session_cpu(onnx_path)?, false, false));
             }
         };
         tracing::info!("qwen3-asr: trying DirectML EP for {}", file_name);
@@ -181,7 +186,7 @@ fn build_session_gpu(
         {
             Ok(session) => {
                 tracing::info!("qwen3-asr: {} loaded with DirectML", file_name);
-                return Ok((session, true));
+                return Ok((session, true, false));
             }
             Err(e) => {
                 tracing::warn!(
@@ -189,6 +194,12 @@ fn build_session_gpu(
                     file_name,
                     e
                 );
+                if provider == Qwen3ExecutionProvider::Auto {
+                    let cpu = build_session_cpu(onnx_path).map_err(|cpu_error| Error::Other(
+                        format!("DirectML failed for {file_name} ({e}); CPU initialization failed ({cpu_error})")
+                    ))?;
+                    return Ok((cpu, false, true));
+                }
                 return Err(Error::Other(format!(
                     "DirectML failed for {file_name}: {e}"
                 )));
@@ -203,6 +214,7 @@ fn build_session_gpu(
             .map_err(ort_err)?
             .commit_from_file(onnx_path)
             .map_err(ort_err)?,
+        false,
         false,
     ))
 }
@@ -277,6 +289,7 @@ pub struct Qwen3AsrEngine {
     using_directml: bool,
     decoder_directml: bool,
     recovery_failure: Option<String>,
+    pending_initialization_recovery: bool,
     /// Positional embeddings stored flat as f16 [max_positions × d_model].
     pos_emb: Vec<f16>,
     pos_emb_cols: usize,
@@ -447,7 +460,7 @@ fn argmax_f16(data: &[f16]) -> u32 {
 
 impl Qwen3AsrEngine {
     pub fn from_dir(dir: &Path) -> Result<Self> {
-        Self::from_dir_with_provider(dir, Qwen3ExecutionProvider::Cpu)
+        Self::from_dir_with_provider(dir, Qwen3ExecutionProvider::Auto)
     }
 
     pub fn from_dir_with_provider(dir: &Path, provider: Qwen3ExecutionProvider) -> Result<Self> {
@@ -458,8 +471,10 @@ impl Qwen3AsrEngine {
         .map_err(|e| Error::Other(format!("config parse error: {}", e)))?;
 
         tracing::info!("loading Qwen3-ASR from {}", dir.display());
-        let (conv_stem, conv_gpu) = build_session_gpu(&dir.join("conv_stem.onnx"), provider)?;
-        let (encoder, encoder_gpu) = build_session_gpu(&dir.join("encoder.onnx"), provider)?;
+        let (conv_stem, conv_gpu, conv_recovered) =
+            build_session_gpu(&dir.join("conv_stem.onnx"), provider)?;
+        let (encoder, encoder_gpu, encoder_recovered) =
+            build_session_gpu(&dir.join("encoder.onnx"), provider)?;
 
         // DirectML accepts the decoder graph but fails its input-dependent
         // Reshape during inference. Keep the convolution and encoder on the
@@ -478,7 +493,7 @@ impl Qwen3AsrEngine {
                 false,
             )
         };
-        let (decoder, decoder_gpu) = decoder;
+        let (decoder, decoder_gpu, decoder_recovered) = decoder;
         let using_directml = conv_gpu || encoder_gpu || decoder_gpu;
         tracing::info!(
             "qwen3-asr: initialized backend={} components={{conv:{},encoder:{},decoder:{}}}",
@@ -505,6 +520,9 @@ impl Qwen3AsrEngine {
             using_directml,
             decoder_directml: decoder_gpu,
             recovery_failure: None,
+            pending_initialization_recovery: conv_recovered
+                || encoder_recovered
+                || decoder_recovered,
             pos_emb,
             pos_emb_cols,
             embed_tokens,
@@ -550,8 +568,11 @@ impl Qwen3AsrEngine {
 
         for f in &[
             "conv_stem.onnx",
+            "conv_stem.onnx.data",
             "encoder.onnx",
+            "encoder.onnx.data",
             "decoder.onnx",
+            "decoder.onnx.data",
             "positional_embedding.npy",
             "embed_tokens.npy",
             "config.json",
@@ -561,15 +582,10 @@ impl Qwen3AsrEngine {
             repo.get(f)
                 .map_err(|e| Error::Download(format!("{}: {}", f, e)))?;
         }
-        // External data files + optional KV cache decoder (may not exist)
-        for f in &[
-            "conv_stem.onnx.data",
-            "encoder.onnx.data",
-            "decoder.onnx.data",
-            "decoder_kv.onnx",
-            "decoder_kv.onnx.data",
-        ] {
-            let _ = repo.get(f);
+        // The KV decoder is optional, but its graph and external weights are a pair.
+        if repo.get("decoder_kv.onnx").is_ok() {
+            repo.get("decoder_kv.onnx.data")
+                .map_err(|e| Error::Download(format!("decoder_kv.onnx.data: {e}")))?;
         }
 
         let config_path = repo
@@ -600,8 +616,11 @@ impl Qwen3AsrEngine {
 
         for f in &[
             "conv_stem.onnx",
+            "conv_stem.onnx.data",
             "encoder.onnx",
+            "encoder.onnx.data",
             "decoder.onnx",
+            "decoder.onnx.data",
             "positional_embedding.npy",
             "embed_tokens.npy",
             "config.json",
@@ -611,14 +630,10 @@ impl Qwen3AsrEngine {
                 return Err(Error::ModelNotCached(name.to_string()));
             }
         }
-        for f in &[
-            "conv_stem.onnx.data",
-            "encoder.onnx.data",
-            "decoder.onnx.data",
-            "decoder_kv.onnx",
-            "decoder_kv.onnx.data",
-        ] {
-            let _ = hf_cache::cache_get(repo_name, f);
+        if hf_cache::cache_get(repo_name, "decoder_kv.onnx").is_some()
+            && hf_cache::cache_get(repo_name, "decoder_kv.onnx.data").is_none()
+        {
+            return Err(Error::ModelNotCached(name.to_string()));
         }
 
         let config_path = hf_cache::cache_get(repo_name, "config.json")
@@ -967,48 +982,49 @@ impl Engine for Qwen3AsrEngine {
             audio.to_vec()
         };
 
+        // Bound the quadratic encoder mask and the decoder's 500-token ceiling.
+        // Do not return until every chunk succeeds: a failure must never look like
+        // a successful partial transcription.
+        const MAX_CHUNK_SAMPLES: usize = 30 * 16000;
         let start = std::time::Instant::now();
-        let token_ids = self.run_pipeline(&audio)?;
-        let elapsed = start.elapsed();
-
-        let raw_text = decode_tokens(&token_ids, &self.id_to_bytes, &self.config.special_tokens);
-
-        // Strip Qwen3-ASR prefix: "language English<asr_text>..." or just "language English..."
-        let text = if let Some(pos) = raw_text.find("<asr_text>") {
-            raw_text[pos + 10..].trim().to_string()
-        } else if let Some(pos) = raw_text.find("English") {
-            raw_text[pos + 7..].trim().to_string()
-        } else if let Some(pos) = raw_text.find("Chinese") {
-            raw_text[pos + 7..].trim().to_string()
-        } else {
-            // Generic: skip "language <LangName>" prefix
-            let trimmed = raw_text.trim();
-            if trimmed.starts_with("language ") {
-                if let Some(space_pos) = trimmed[9..].find(|c: char| !c.is_alphabetic()) {
-                    trimmed[9 + space_pos..].trim().to_string()
-                } else {
-                    trimmed.to_string()
-                }
-            } else {
-                trimmed.to_string()
+        let mut total_tokens = 0usize;
+        let mut texts = Vec::new();
+        let mut segments = Vec::new();
+        for (index, chunk) in audio.chunks(MAX_CHUNK_SAMPLES).enumerate() {
+            let token_ids = self.run_pipeline(chunk)?;
+            total_tokens += token_ids.len();
+            let raw_text =
+                decode_tokens(&token_ids, &self.id_to_bytes, &self.config.special_tokens);
+            let text = strip_asr_prefix(&raw_text);
+            if !text.is_empty() {
+                texts.push(text.clone());
             }
-        };
+            let start_secs = index as f64 * 30.0;
+            segments.push(crate::model::Segment {
+                start_secs,
+                end_secs: start_secs + chunk.len() as f64 / 16000.0,
+                text,
+            });
+        }
+        let elapsed = start.elapsed();
+        let text = texts.join(" ");
 
-        let audio_duration = audio.len() as f64 / 16000.0;
+        if self.pending_initialization_recovery {
+            tracing::warn!(
+                "qwen3-asr: CPU/mixed inference completed after DirectML initialization recovery"
+            );
+            self.pending_initialization_recovery = false;
+        }
 
         tracing::info!(
             "qwen3-asr: {} tokens in {:.2}s",
-            token_ids.len(),
+            total_tokens,
             elapsed.as_secs_f64()
         );
 
         Ok(TranscribeResult {
             text: text.clone(),
-            segments: vec![crate::model::Segment {
-                start_secs: 0.0,
-                end_secs: audio_duration,
-                text,
-            }],
+            segments,
         })
     }
 
@@ -1060,5 +1076,24 @@ impl Engine for Qwen3AsrEngine {
         self.decoder = Some(decoder);
         tracing::warn!("qwen3-asr: CPU recovery initialized after DirectML inference failure");
         Ok(true)
+    }
+}
+
+fn strip_asr_prefix(raw_text: &str) -> String {
+    if let Some(pos) = raw_text.find("<asr_text>") {
+        raw_text[pos + 10..].trim().to_string()
+    } else if let Some(pos) = raw_text.find("English") {
+        raw_text[pos + 7..].trim().to_string()
+    } else if let Some(pos) = raw_text.find("Chinese") {
+        raw_text[pos + 7..].trim().to_string()
+    } else {
+        let trimmed = raw_text.trim();
+        if let Some(rest) = trimmed.strip_prefix("language ") {
+            rest.find(|c: char| !c.is_alphabetic())
+                .map(|pos| rest[pos..].trim().to_string())
+                .unwrap_or_else(|| trimmed.to_string())
+        } else {
+            trimmed.to_string()
+        }
     }
 }
