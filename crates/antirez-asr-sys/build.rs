@@ -37,7 +37,8 @@ fn main() {
         build.std("c11");
     } else {
         build.file(src.join("qwen_asr_audio.c"));
-        build.flag("-std=c11");
+        // The upstream sources need POSIX declarations and GNU expressions.
+        build.std("gnu11");
     }
 
     let use_openblas = std::env::var("CARGO_FEATURE_OPENBLAS").is_ok();

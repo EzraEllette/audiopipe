@@ -1,0 +1,30 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+name: Antirez C build
+
+on:
+  pull_request:
+    paths:
+      - crates/antirez-asr-sys/**
+      - .github/workflows/antirez-c-build.yml
+  push:
+    branches: [main]
+    paths:
+      - crates/antirez-asr-sys/**
+      - .github/workflows/antirez-c-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  linux-posix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile native C sources with POSIX declarations checked
+        env:
+          CFLAGS: -Werror=implicit-function-declaration
+        run: cargo check --manifest-path crates/antirez-asr-sys/Cargo.toml
